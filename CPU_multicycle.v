@@ -17,7 +17,7 @@ module CPU_multicycle
 	reg [7:0] registers [0:15];
 	reg is_Halted = 1'b1;
 	reg [15:0] instruction = 16'b0000000000000000;
-	reg [2:0] r_SM_CPU = 3'b000;
+	reg [3:0] r_SM_CPU = 4'b0000;
 	reg [3:0] r_OPCODE = 4'b0000;
 	reg [3:0] r_reg1 = 4'b0000;
 	reg [3:0] r_reg2 = 4'b0000;
@@ -51,6 +51,10 @@ module CPU_multicycle
 	reg r_RX_DV;
 	reg is_Halted2;
 	reg [15:0] load_data;
+	reg [7:0] r_TX_Byte;
+	reg r_TX_DV = 1'b0;
+	reg send_DV = 1'b0;
+	reg send_DV_prog;
 	
 	initial
 	begin
@@ -70,6 +74,7 @@ module CPU_multicycle
 	registers[13] = 8'b0;
 	registers[14] = 8'b0;
 	registers[15] = 8'b0;
+	send_DV = 1'b0;
 	end
 	
 	
@@ -93,23 +98,29 @@ module CPU_multicycle
 	parameter XOR = 4'b1010;
 	parameter AND = 4'b1011;
 	parameter OR = 4'b1100;
+	parameter SEND = 4'b1101;
+	parameter MOV = 4'b1110;
 	parameter HALT = 4'b1111;
 
-	parameter FETCH1 = 3'b000;
-	parameter FETCH2 = 3'b001;
-	parameter DECODE = 3'b010;
-	parameter EXECUTE = 3'b011;
-	parameter MEMWAIT = 3'b100;
-	parameter MEMWAIT2 = 3'b101;
-	parameter WRITEBACK = 3'b110;
-	parameter HALTED = 3'b111;
-	
+	parameter FETCH1 = 4'b0000;
+	parameter FETCH2 = 4'b0001;
+	parameter FETCH3 = 4'b0010;
+	parameter DECODE = 4'b0011;
+	parameter EXECUTE = 4'b0100;
+	parameter MEMWAIT = 4'b0101;
+	parameter MEMWAIT2 = 4'b0110;
+	parameter WRITEBACK = 4'b0111;
+	parameter SEND_WAIT = 4'b1000;
+	parameter HALTED = 4'b1001;
 	
 	wire [7:0] w_RX_Byte;
 	wire w_RX_DV;
 	wire w_TX_Active;
 	wire w_TX_Serial;
 	wire w_Halted;
+	wire [7:0] w_TX_Byte;
+	wire w_TX_DV;
+	wire send_DV_fin;
 		
 	UART_RX #(.CLKS_PER_BIT(217)) Inst
 	(.i_Clk(i_Clk),
@@ -119,8 +130,8 @@ module CPU_multicycle
 	
 	UART_TX #(.CLKS_PER_BIT(217)) Inst3
 	(.i_Clock(i_Clk),
-	.i_TX_DV(w_RX_DV),
-	.i_TX_Byte(w_RX_Byte),
+	.i_TX_DV(w_TX_DV),
+	.i_TX_Byte(w_TX_Byte),
 	.o_TX_Active(w_TX_Active),
 	.o_TX_Serial(w_TX_Serial),
 	.o_TX_Done());
@@ -136,8 +147,10 @@ module CPU_multicycle
 			r_LED_4 <= 1'b1;
 		if(is_Halted2 == 1'b1)
 			is_Halted <= 1'b1;
-	r_RX_DV <= w_RX_DV;
-	r_RX_Byte <= w_RX_Byte;
+			
+		r_RX_DV <= w_RX_DV;
+		r_RX_Byte <= w_RX_Byte;
+		
 		if(i_Switch_2)
 		begin
 		r_LED_4 <= 1'b0;
@@ -153,8 +166,9 @@ module CPU_multicycle
 				r_LED_4 <= 1'b0;
 				is_Halted <= 1'b0;
 			end
-		if (is_Halted )
+		if (is_Halted)
 		begin	
+			send_DV_prog <= 1'b0;
 			case (r_SM_PROGRAM)
 				IDLE : 
 				begin
@@ -266,11 +280,19 @@ module CPU_multicycle
 				begin
 					reg_Write <= 0;
 					CPU_mem_we <= 0;
+					send_DV <= 1'b0;
+					r_TX_DV <= 1'b0;
+					r_TX_Byte <= 1'b0;
 					CPU_mem_addr <= r_PC_CPU;
 					r_SM_CPU <= FETCH2;
 				end
 				
 				FETCH2 : 
+				begin
+					r_SM_CPU <= FETCH3;
+				end
+				
+				FETCH3 :
 				begin
 					instruction <= mem_rdata;
 					r_SM_CPU <= DECODE;
@@ -290,20 +312,35 @@ module CPU_multicycle
 					take_branch = 0; 
 					
 					if (r_OPCODE == JZ)
-						take_branch = (registers[r_reg1] == 0);
+					begin
+						if (registers[r_reg1] == 0)
+							take_branch = 1'b1;
+						else if (registers[r_reg1] != 0)
+							take_branch = 1'b0;
+					end
 					else if (r_OPCODE == JNZ)
 						take_branch = (registers[r_reg1] != 0);
 					else if (r_OPCODE == JUMP)
 						take_branch = 1;
+					else 
+						take_branch  = 0;
 
 					branch_target = immediate;
-
-					if (take_branch)
-						pc_next = branch_target;
-					else
-						pc_next = r_PC_CPU + 1;
 					
-					r_PC_CPU <= pc_next;
+					if ((r_OPCODE == JZ) || (r_OPCODE == JNZ) || (r_OPCODE == JUMP))
+					begin
+						if (take_branch)
+							r_PC_CPU <= branch_target;
+						else
+							r_PC_CPU <= r_PC_CPU + 1;
+					end
+					else if (r_OPCODE == SEND && w_TX_Active == 1'b1)
+						r_PC_CPU <= r_PC_CPU;
+					else if (r_OPCODE != HALT)
+						r_PC_CPU <= r_PC_CPU + 1;
+					else if (r_OPCODE == HALT)
+						r_PC_CPU <= r_PC_CPU;
+					
 						
 					case (r_OPCODE)
 						LOADI :
@@ -324,6 +361,21 @@ module CPU_multicycle
 						begin
 							result <= registers[r_reg1] + registers[r_reg2];
 							reg_Write <= 1'b1;
+							r_SM_CPU <= WRITEBACK;
+						end
+						
+						JUMP :
+						begin
+							r_SM_CPU <= WRITEBACK;
+						end
+						
+						JZ :
+						begin
+							r_SM_CPU <= WRITEBACK;
+						end
+						
+						JNZ :
+						begin
 							r_SM_CPU <= WRITEBACK;
 						end
 						
@@ -380,6 +432,24 @@ module CPU_multicycle
 							reg_Write <= 1'b0;
 						end
 						
+						SEND :
+						begin
+							if (w_TX_Active == 0) 
+							begin
+								r_TX_DV   <= 1'b1;
+								r_TX_Byte <= registers[r_reg1];
+								send_DV   <= 1'b1;
+								r_SM_CPU  <= SEND_WAIT;
+							end
+						end
+						
+						MOV :
+						begin
+							result <= registers[r_reg2];
+							reg_Write <= 1'b1;
+							r_SM_CPU <= WRITEBACK;
+						end
+						
 						HALT : 
 						begin
 							is_Halted2 <= 1'b1;
@@ -387,6 +457,19 @@ module CPU_multicycle
 						end
 						
 					endcase
+				end
+				
+				SEND_WAIT : 
+				begin
+				if (w_TX_Active == 1'b1) 
+					begin
+						r_TX_DV  <= 1'b0;
+						send_DV  <= 1'b0;
+						r_SM_CPU <= WRITEBACK;
+					end
+					
+				else 
+					r_SM_CPU <= SEND_WAIT;
 				end
 				
 				MEMWAIT : 
@@ -404,6 +487,8 @@ module CPU_multicycle
 				WRITEBACK :
 				begin
 					CPU_mem_we <= 1'b0;
+					send_DV <= 1'b0;
+					r_TX_DV <= 1'b0;
 					if (reg_Write && r_OPCODE == LOAD)
 					begin
 						registers[load_reg] <= load_data[7:0];
@@ -436,6 +521,7 @@ module CPU_multicycle
 	assign mem_addr  = (is_Halted) ? prog_mem_addr  : ((r_SM_CPU == FETCH1) ? r_PC_CPU : CPU_mem_addr);
 	assign mem_wdata = (is_Halted) ? prog_mem_wdata : CPU_mem_wdata;
 	assign mem_we    = (is_Halted) ? prog_mem_we    : CPU_mem_we;
+	assign send_DV_fin = (is_Halted) ? send_DV_prog : send_DV;
 	assign o_reg0 = registers[1];
 	assign o_UART_TX = w_TX_Active ? w_TX_Serial : 1'b1;
 	assign o_TX_Active = w_TX_Active;
@@ -444,6 +530,11 @@ module CPU_multicycle
 	assign o_LED_3 = r_LED_3;
 	assign o_LED_4 = r_LED_4;
 	
+	assign w_TX_DV = (send_DV_fin) ? r_TX_DV : w_RX_DV;
+	assign w_TX_Byte = (send_DV_fin) ? r_TX_Byte : w_RX_Byte;
+	/*
+	assign w_TX_DV = w_RX_DV;
+	assign w_TX_Byte = w_RX_Byte;
+	*/
 	
 endmodule
-		
